@@ -1,0 +1,28 @@
+YETIPSY「今晚开局」V1.0 — 最短安装步骤
+
+1. 新建 Google Sheet
+2. Sheet -> 扩展程序 -> Apps Script
+3. 把 Code.gs 全部贴进去
+4. 运行 setup()
+5. 保存执行日志里的 owner / staff 随机 PIN
+6. 部署 Web App：Execute as Me / Anyone
+7. 复制 /exec URL
+8. 打开 api.js，把 PASTE_YOUR_APPS_SCRIPT_EXEC_URL_HERE 换成 /exec URL
+9. 新建 GitHub repo（建议 yetipsy-tonight-open）
+10. 上传：
+    index.html
+    player.js
+    staff.html
+    staff.js
+    owner.html
+    owner.js
+    api.js
+    styles.css
+11. 开 GitHub Pages
+12. 先打开 owner.html 登录
+13. 再打开 staff.html -> OPEN SESSION
+14. Staff 页面会生成当晚签到 QR
+15. 用两台以上手机扫描测试签到、自动分桌
+16. 人齐 -> LOCK TABLES -> START GAME
+
+注意：这是全新项目，不要覆盖旧版今晚有局，除非你确定旧版不要了。
