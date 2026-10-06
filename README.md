@@ -1,3 +1,5 @@
+> 最新更新：请同时阅读 `README-V1.1.md`。
+
 # YETIPSY「今晚开局」V1.0
 
 这是一个全新项目，不依赖旧版 `yetipsy-tonight`。

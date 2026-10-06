@@ -1,5 +1,5 @@
 /*
- * YETIPSY「今晚开局」Backend V1.0
+ * YETIPSY「今晚开局」Backend V1.1
  * Google Apps Script + Google Sheets
  *
  * Setup:
@@ -10,7 +10,7 @@
  * 5) Deploy as Web App: Execute as Me, access Anyone
  */
 
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 const PROP_SHEET_ID = 'YT_OPEN_SHEET_ID';
 const PROP_APP_SECRET = 'YT_OPEN_APP_SECRET';
 const PLAYER_AUTH_DAYS = 180;
@@ -90,6 +90,7 @@ function doPost(e) {
       registerAndCheckIn: registerAndCheckIn_,
       loginAndCheckIn: loginAndCheckIn_,
       resumeAndCheckIn: resumeAndCheckIn_,
+      playerLogin: playerLogin_,
       playerHome: playerHome_,
       playerProfile: playerProfile_,
       claimMission: claimMission_,
@@ -192,6 +193,24 @@ function resumeAndCheckIn_(ss, d) {
   return {ok:true,player_id:auth.player_id,checkin:checkin};
 }
 
+
+function playerLogin_(ss, d) {
+  const phone = normalizePhone_(d.phone);
+  const pin = String(d.pin || '').trim();
+  const sh = ss.getSheetByName('PLAYERS');
+  const p = findRow_(sh,'phone',phone);
+  if (!p || String(p.status||'').toUpperCase()!=='ACTIVE') return {ok:false,error:'login_failed'};
+  if (p.locked_until && new Date(p.locked_until).getTime() > Date.now()) return {ok:false,error:'login_locked'};
+  if (p.pin_hash !== hashPin_(pin,p.salt)) {
+    const n = Number(p.failed_login_count || 0) + 1;
+    updateRow_(sh,p._row,{failed_login_count:n,locked_until:n>=MAX_LOGIN_FAILS?new Date(Date.now()+LOGIN_LOCK_MIN*60000):''});
+    return {ok:false,error:n>=MAX_LOGIN_FAILS?'login_locked':'login_failed'};
+  }
+  updateRow_(sh,p._row,{failed_login_count:0,locked_until:'',last_login:new Date()});
+  const auth = issuePlayerAuth_(ss,p.player_id,clean_(d.deviceId,120));
+  return {ok:true,auth_token:auth,player_id:p.player_id};
+}
+
 function playerHome_(ss, d) {
   const auth = requirePlayer_(ss,d.authToken);
   const player = findRow_(ss.getSheetByName('PLAYERS'),'player_id',auth.player_id);
@@ -204,10 +223,11 @@ function playerHome_(ss, d) {
   const scores = getScores_(ss,session.session_id);
   const incoming = getIncomingChallenge_(ss,session.session_id,auth.player_id);
   const claimRequest = getPendingClaimRequest_(ss,session.session_id,auth.player_id);
+  const outgoing = getOutgoingChallenge_(ss,session.session_id,auth.player_id);
   return {
     ok:true, player:publicPlayer_(player), session:publicSession_(session), checked_in:true,
     table_id:ci.table_id, seat_code:ci.seat_code, mission:mission, coin_balance:balance,
-    scores:scores, incoming_challenge:incoming, mission_confirmation:claimRequest
+    scores:scores, incoming_challenge:incoming, outgoing_challenge:outgoing, mission_confirmation:claimRequest
   };
 }
 
@@ -218,7 +238,8 @@ function playerProfile_(ss,d) {
   const missions = rows_(ss.getSheetByName('PLAYER_MISSIONS')).filter(x=>x.player_id===auth.player_id && x.status==='COMPLETED').length;
   const challenges = rows_(ss.getSheetByName('CHALLENGES')).filter(x=>x.from_player_id===auth.player_id || x.to_player_id===auth.player_id).length;
   const rewards = rows_(ss.getSheetByName('REWARDS')).filter(x=>bool_(x.active)).map(r=>({reward_id:r.reward_id,name:r.name,cost:Number(r.cost),description:r.description}));
-  return {ok:true,player:publicPlayer_(p),coin_balance:coinBalance_(ss,auth.player_id),missions_completed:missions,challenges:challenges,ledger:ledger,rewards:rewards};
+  const activeCi = rows_(ss.getSheetByName('CHECKINS')).filter(x=>x.player_id===auth.player_id).map(ci=>({ci:ci,s:getSession_(ss,ci.session_id)})).filter(x=>x.s&&['CHECK_IN','TABLES_LOCKED','LIVE'].includes(x.s.status)).sort((a,b)=>new Date(b.s.created_at)-new Date(a.s.created_at))[0]||null;
+  return {ok:true,player:publicPlayer_(p),coin_balance:coinBalance_(ss,auth.player_id),missions_completed:missions,challenges:challenges,ledger:ledger,rewards:rewards,active_session:activeCi?{session:publicSession_(activeCi.s),table_id:activeCi.ci.table_id,seat_code:activeCi.ci.seat_code}:null};
 }
 
 // ------------------------- Sessions/tables/check-in -------------------------
@@ -434,6 +455,18 @@ function getIncomingChallenge_(ss,sessionId,playerId) {
   const c=rows_(ss.getSheetByName('CHALLENGES')).filter(x=>x.session_id===sessionId&&x.to_player_id===playerId&&x.status==='PENDING'&&new Date(x.expires_at).getTime()>Date.now()).sort((a,b)=>new Date(b.created_at)-new Date(a.created_at))[0];
   if(!c) return null; const p=findRow_(ss.getSheetByName('PLAYERS'),'player_id',c.from_player_id); const ci=findCheckin_(ss,sessionId,c.from_player_id);
   return {challenge_id:c.challenge_id,from_player_id:c.from_player_id,from_nickname:p?p.nickname:c.from_player_id,from_table:ci?ci.table_id:'',game:c.game,expires_at:c.expires_at};
+}
+
+
+function getOutgoingChallenge_(ss,sessionId,playerId) {
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  const c = rows_(ss.getSheetByName('CHALLENGES'))
+    .filter(x=>x.session_id===sessionId && x.from_player_id===playerId && new Date(x.created_at).getTime()>=cutoff)
+    .sort((a,b)=>new Date(b.created_at)-new Date(a.created_at))[0];
+  if(!c) return null;
+  const p=findRow_(ss.getSheetByName('PLAYERS'),'player_id',c.to_player_id);
+  const ci=findCheckin_(ss,sessionId,c.to_player_id);
+  return {challenge_id:c.challenge_id,to_player_id:c.to_player_id,to_nickname:p?p.nickname:c.to_player_id,to_table:ci?ci.table_id:'',game:c.game,status:c.status,responded_at:c.responded_at,expires_at:c.expires_at};
 }
 
 function respondChallenge_(ss,d) {

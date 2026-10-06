@@ -1,0 +1,15 @@
+YETIPSY 今晚开局 V1.1 更新
+
+1. Apps Script 覆盖 Code.gs
+2. 管理部署 -> 编辑 -> 新版本 -> Deploy
+3. 确认 /exec -> version 1.1.0
+4. GitHub 覆盖 index.html / player.js / staff.html / staff.js / styles.css
+5. GitHub 新增 sw.js
+6. 已经配置好的 api.js 不要覆盖
+
+重点测试：
+- 玩家签到后刷新 -> 直接回游戏
+- Staff LOCK TABLES -> 玩家不用刷新，Mission 自动出现
+- A Challenge B -> B 自动弹 Drawer / Notification
+- Staff QR 不再每 20 秒重画
+- 不扫 QR 也能从首页 MY PROFILE 登入查看 Coin
