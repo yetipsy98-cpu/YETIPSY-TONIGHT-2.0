@@ -1,5 +1,5 @@
 window.YT_API = (()=>{
-  const API_URL = 'PASTE_YOUR_APPS_SCRIPT_EXEC_URL_HERE';
+  const API_URL = 'https://script.google.com/macros/s/AKfycby4cZXXCMlZBTcuPzuShHq2K3zUUXxlL6MAb_-Et_6uKX-gO8WCgbcyHnWvsfQQBn7Jpg/exec';
   const TIMEOUT = 12000;
   const configured = () => /^https:\/\/script\.google\.com\/macros\/s\/.+\/exec$/.test(API_URL);
   async function post(action,data={}){
