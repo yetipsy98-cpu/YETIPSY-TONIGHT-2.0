@@ -10,7 +10,7 @@
  * 5) Deploy as Web App: Execute as Me, access Anyone
  */
 
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.3.0';
 const PROP_SHEET_ID = 'YT_OPEN_SHEET_ID';
 const PROP_APP_SECRET = 'YT_OPEN_APP_SECRET';
 const PLAYER_AUTH_DAYS = 180;
@@ -50,6 +50,7 @@ function setup() {
   Object.keys(SCHEMA).forEach(name => ensureSheet_(ss, name, SCHEMA[name]));
   seedConfig_(ss);
   seedMissions_(ss);
+  migrateMissionsV130_(ss);
   seedRewards_(ss);
   const creds = seedInitialStaff_(ss);
   SpreadsheetApp.flush();
@@ -161,7 +162,8 @@ function registerAndCheckIn_(ss, d) {
     });
     const auth = issuePlayerAuth_(ss, playerId, clean_(d.deviceId, 120));
     const checkin = checkInPlayer_(ss, gate.session.session_id, playerId, d.companionCode, true);
-    return {ok:true, auth_token:auth, player_id:playerId, checkin:checkin};
+    const bootstrap = buildPlayerHome_(ss, playerId, gate.session.session_id);
+    return {ok:true, auth_token:auth, player_id:playerId, checkin:checkin, bootstrap:bootstrap};
   } finally { lock.releaseLock(); }
 }
 
@@ -182,7 +184,8 @@ function loginAndCheckIn_(ss, d) {
   updateRow_(sh,p._row,{failed_login_count:0,locked_until:'',last_login:new Date()});
   const auth = issuePlayerAuth_(ss,p.player_id,clean_(d.deviceId,120));
   const checkin = checkInPlayer_(ss, gate.session.session_id, p.player_id, d.companionCode);
-  return {ok:true,auth_token:auth,player_id:p.player_id,checkin:checkin};
+  const bootstrap = buildPlayerHome_(ss, p.player_id, gate.session.session_id);
+  return {ok:true,auth_token:auth,player_id:p.player_id,checkin:checkin,bootstrap:bootstrap};
 }
 
 function resumeAndCheckIn_(ss, d) {
@@ -190,7 +193,8 @@ function resumeAndCheckIn_(ss, d) {
   if (!gate.ok) return gate;
   const auth = requirePlayer_(ss,d.authToken);
   const checkin = checkInPlayer_(ss,gate.session.session_id,auth.player_id,d.companionCode);
-  return {ok:true,player_id:auth.player_id,checkin:checkin};
+  const bootstrap = buildPlayerHome_(ss, auth.player_id, gate.session.session_id);
+  return {ok:true,player_id:auth.player_id,checkin:checkin,bootstrap:bootstrap};
 }
 
 
@@ -213,21 +217,110 @@ function playerLogin_(ss, d) {
 
 function playerHome_(ss, d) {
   const auth = requirePlayer_(ss,d.authToken);
-  const player = findRow_(ss.getSheetByName('PLAYERS'),'player_id',auth.player_id);
-  const session = getSession_(ss,d.sessionId) || getLatestPlayerSession_(ss,auth.player_id);
-  if (!session) return {ok:true,player:publicPlayer_(player),session:null};
-  const ci = findCheckin_(ss,session.session_id,auth.player_id);
-  if (!ci) return {ok:true,player:publicPlayer_(player),session:publicSession_(session),checked_in:false};
-  const mission = getPlayerMissionView_(ss,session.session_id,auth.player_id);
-  const balance = coinBalance_(ss,auth.player_id);
-  const scores = getScores_(ss,session.session_id);
-  const incoming = getIncomingChallenge_(ss,session.session_id,auth.player_id);
-  const claimRequest = getPendingClaimRequest_(ss,session.session_id,auth.player_id);
-  const outgoing = getOutgoingChallenge_(ss,session.session_id,auth.player_id);
+  return buildPlayerHome_(ss, auth.player_id, d.sessionId);
+}
+
+/*
+ * Build the whole in-session player snapshot with one read per sheet.
+ * This is intentionally used both after check-in (bootstrap) and during sync.
+ * It avoids the older helper chain that repeatedly re-read CHECKINS / PLAYERS /
+ * CHALLENGES / PLAYER_MISSIONS during a single request.
+ */
+function buildPlayerHome_(ss, playerId, requestedSessionId) {
+  const players = rows_(ss.getSheetByName('PLAYERS'));
+  const player = players.find(x=>x.player_id===playerId) || null;
+  if (!player) return {ok:false,error:'player_not_found'};
+
+  const sessions = rows_(ss.getSheetByName('SESSIONS'));
+  const allCheckins = rows_(ss.getSheetByName('CHECKINS'));
+
+  let session = null;
+  if (requestedSessionId) session = sessions.find(x=>x.session_id===String(requestedSessionId)) || null;
+  if (!session) {
+    const mine = allCheckins.filter(x=>x.player_id===playerId);
+    const sessionIds = new Set(mine.map(x=>x.session_id));
+    session = sessions.filter(x=>sessionIds.has(x.session_id)).sort((a,b)=>new Date(b.created_at)-new Date(a.created_at))[0] || null;
+  }
+  if (!session) return {ok:true,player:publicPlayer_(player),session:null,server_ts:new Date().toISOString()};
+
+  const sessionCheckins = allCheckins.filter(x=>x.session_id===session.session_id && x.status==='ACTIVE');
+  const ci = sessionCheckins.find(x=>x.player_id===playerId) || null;
+  if (!ci) return {ok:true,player:publicPlayer_(player),session:publicSession_(session),checked_in:false,server_ts:new Date().toISOString()};
+
+  const missionRows = rows_(ss.getSheetByName('PLAYER_MISSIONS'));
+  const missionDefs = rows_(ss.getSheetByName('MISSIONS'));
+  const myPm = missionRows.find(x=>x.session_id===session.session_id && x.player_id===playerId) || null;
+  let mission = null;
+  if (myPm) {
+    const m = missionDefs.find(x=>x.mission_id===myPm.mission_id) || null;
+    if (m) mission = {mission_id:m.mission_id,title:m.title,description:m.description,reward_coin:Number(m.reward_coin||0),type:m.type,verification:m.verification,status:myPm.status,claim_status:myPm.claim_status};
+  }
+
+  const ledgerRows = rows_(ss.getSheetByName('COIN_LEDGER'));
+  const balance = ledgerRows.filter(x=>x.player_id===playerId).reduce((sum,x)=>sum+Number(x.delta||0),0);
+
+  const scoreRows = rows_(ss.getSheetByName('TABLES')).filter(x=>x.session_id===session.session_id);
+  const scores = scoreRows.map(x=>({table_id:x.table_id,score:Number(x.score||0)}));
+
+  const challengeRows = rows_(ss.getSheetByName('CHALLENGES')).filter(x=>x.session_id===session.session_id);
+  const playerMap = {};
+  players.forEach(p=>playerMap[p.player_id]=p);
+  const checkinMap = {};
+  sessionCheckins.forEach(x=>checkinMap[x.player_id]=x);
+  const now = Date.now();
+
+  const incomingRow = challengeRows
+    .filter(x=>x.to_player_id===playerId && x.status==='PENDING' && new Date(x.expires_at).getTime()>now)
+    .sort((a,b)=>new Date(b.created_at)-new Date(a.created_at))[0] || null;
+  const incoming = incomingRow ? {
+    challenge_id:incomingRow.challenge_id,
+    from_player_id:incomingRow.from_player_id,
+    from_nickname:(playerMap[incomingRow.from_player_id]||{}).nickname || incomingRow.from_player_id,
+    from_table:(checkinMap[incomingRow.from_player_id]||{}).table_id || '',
+    game:incomingRow.game,
+    expires_at:incomingRow.expires_at
+  } : null;
+
+  const cutoff = now - 10*60*1000;
+  const outgoingRow = challengeRows
+    .filter(x=>x.from_player_id===playerId && new Date(x.created_at).getTime()>=cutoff)
+    .sort((a,b)=>new Date(b.created_at)-new Date(a.created_at))[0] || null;
+  const outgoing = outgoingRow ? {
+    challenge_id:outgoingRow.challenge_id,
+    to_player_id:outgoingRow.to_player_id,
+    to_nickname:(playerMap[outgoingRow.to_player_id]||{}).nickname || outgoingRow.to_player_id,
+    to_table:(checkinMap[outgoingRow.to_player_id]||{}).table_id || '',
+    game:outgoingRow.game,
+    status:outgoingRow.status,
+    responded_at:outgoingRow.responded_at,
+    expires_at:outgoingRow.expires_at
+  } : null;
+
+  const claimRow = missionRows.find(x=>x.session_id===session.session_id && x.claim_target_player_id===playerId && x.status==='CLAIM_PENDING' && x.claim_status==='PENDING') || null;
+  const claimRequest = claimRow ? {
+    from_player_id:claimRow.player_id,
+    from_nickname:(playerMap[claimRow.player_id]||{}).nickname || claimRow.player_id
+  } : null;
+
+  const challengeTargets = sessionCheckins
+    .filter(x=>x.player_id!==playerId && x.table_id!==ci.table_id)
+    .map(x=>({player_id:x.player_id,nickname:(playerMap[x.player_id]||{}).nickname||x.player_id,table_id:x.table_id}));
+
   return {
-    ok:true, player:publicPlayer_(player), session:publicSession_(session), checked_in:true,
-    table_id:ci.table_id, seat_code:ci.seat_code, mission:mission, coin_balance:balance,
-    scores:scores, incoming_challenge:incoming, outgoing_challenge:outgoing, mission_confirmation:claimRequest
+    ok:true,
+    player:publicPlayer_(player),
+    session:publicSession_(session),
+    checked_in:true,
+    table_id:ci.table_id,
+    seat_code:ci.seat_code,
+    mission:mission,
+    coin_balance:balance,
+    scores:scores,
+    incoming_challenge:incoming,
+    outgoing_challenge:outgoing,
+    mission_confirmation:claimRequest,
+    challenge_targets:challengeTargets,
+    server_ts:new Date().toISOString()
   };
 }
 
@@ -446,7 +539,8 @@ function sendChallenge_(ss,d) {
   const id='CH-'+Utilities.getUuid().slice(0,8).toUpperCase();
   appendObj_(ss.getSheetByName('CHALLENGES'),{challenge_id:id,session_id:d.sessionId,from_player_id:auth.player_id,to_player_id:toId,game:clean_(d.game,40),status:'PENDING',created_at:new Date(),responded_at:'',expires_at:new Date(Date.now()+3*60000)});
   logEvent_(ss,d.sessionId,'CHALLENGE_SENT',auth.player_id,toId,fromCi.table_id,{game:d.game},'SYSTEM');
-  checkMissionEvent_(ss,d.sessionId,auth.player_id,'CHALLENGE_SENT',{target:toId});
+  // Sending alone is not enough to complete a sender mission.
+  // Sender-side challenge missions are checked only after the target ACCEPTS.
   checkMissionEvent_(ss,d.sessionId,toId,'CHALLENGE_RECEIVED',{from:auth.player_id});
   return {ok:true,challenge_id:id};
 }
@@ -539,8 +633,8 @@ function bool_(v){return v===true||String(v).toLowerCase()==='true'||String(v)==
 function clamp_(n,min,max){return Math.max(min,Math.min(max,n));}
 function randomDigits_(n){let s='';for(let i=0;i<n;i++)s+=Math.floor(Math.random()*10);return s;}
 function hashPin_(pin,salt){const secret=PropertiesService.getScriptProperties().getProperty(PROP_APP_SECRET)||'';const bytes=Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,String(pin)+'|'+String(salt)+'|'+secret);return Utilities.base64EncodeWebSafe(bytes).replace(/=+$/,'');}
-function issuePlayerAuth_(ss,pid,deviceId){const token=Utilities.getUuid()+Utilities.getUuid();appendObj_(ss.getSheetByName('PLAYER_SESSIONS'),{auth_token:token,player_id:pid,device_id:deviceId,expires_at:new Date(Date.now()+PLAYER_AUTH_DAYS*86400000),created_at:new Date(),last_seen:new Date()});return token;}
-function requirePlayer_(ss,token){const sh=ss.getSheetByName('PLAYER_SESSIONS');const a=findRow_(sh,'auth_token',String(token||''));if(!a||new Date(a.expires_at).getTime()<Date.now())throw new Error('player_auth_required');updateRow_(sh,a._row,{last_seen:new Date()});return a;}
+function issuePlayerAuth_(ss,pid,deviceId){const token=Utilities.getUuid()+Utilities.getUuid();const expires=new Date(Date.now()+PLAYER_AUTH_DAYS*86400000);appendObj_(ss.getSheetByName('PLAYER_SESSIONS'),{auth_token:token,player_id:pid,device_id:deviceId,expires_at:expires,created_at:new Date(),last_seen:new Date()});try{CacheService.getScriptCache().put('PA:'+token,JSON.stringify({player_id:pid,expires_at:expires.toISOString()}),21600);}catch(e){}return token;}
+function requirePlayer_(ss,token){token=String(token||'');if(!token)throw new Error('player_auth_required');const ck='PA:'+token;try{const hit=CacheService.getScriptCache().get(ck);if(hit){const a=JSON.parse(hit);if(new Date(a.expires_at).getTime()>Date.now())return a;}}catch(e){}const sh=ss.getSheetByName('PLAYER_SESSIONS');const a=findRow_(sh,'auth_token',token);if(!a||new Date(a.expires_at).getTime()<Date.now())throw new Error('player_auth_required');const last=a.last_seen?new Date(a.last_seen).getTime():0;if(!last||Date.now()-last>5*60*1000)updateRow_(sh,a._row,{last_seen:new Date()});try{CacheService.getScriptCache().put(ck,JSON.stringify({player_id:a.player_id,expires_at:new Date(a.expires_at).toISOString()}),21600);}catch(e){}return a;}
 function requireStaff_(ss,token,roles){const sh=ss.getSheetByName('STAFF_SESSIONS');const a=findRow_(sh,'auth_token',String(token||''));if(!a||new Date(a.expires_at).getTime()<Date.now())throw new Error('staff_auth_required');const staff=findRow_(ss.getSheetByName('STAFF'),'staff_id',a.staff_id);if(!staff||!bool_(staff.active)||roles.indexOf(String(staff.role))<0)throw new Error('staff_forbidden');updateRow_(sh,a._row,{last_seen:new Date()});return{staff_id:staff.staff_id,name:staff.name,role:staff.role};}
 function qrToken_(sid,slot){const secret=PropertiesService.getScriptProperties().getProperty(PROP_APP_SECRET)||'';const bytes=Utilities.computeHmacSha256Signature(sid+'|'+slot,secret);return Utilities.base64EncodeWebSafe(bytes).replace(/=+$/,'').slice(0,22);}
 function verifyQrToken_(sid,token){const slot=Math.floor(Date.now()/QR_SLOT_MS);for(let i=0;i<=QR_GRACE_SLOTS;i++){if(qrToken_(sid,slot-i)===String(token||''))return true;}return false;}
@@ -550,7 +644,7 @@ function setConfig_(ss,key,value){const sh=ss.getSheetByName('CONFIG');const r=f
 function seedConfig_(ss){const defaults={BRAND_NAME:'YETIPSY 今晚开局',DEFAULT_CAPACITY:'10',DEFAULT_TABLE_COUNT:'2',DEFAULT_TABLE_SIZE:'5',GROUP_POLICY:'PAIR_TOGETHER_SPLIT_3PLUS',QR_REFRESH_SECONDS:'60',QR_GRACE_SECONDS:'60'};Object.keys(defaults).forEach(k=>{if(!findRow_(ss.getSheetByName('CONFIG'),'key',k))appendObj_(ss.getSheetByName('CONFIG'),{key:k,value:defaults[k]});});}
 function seedInitialStaff_(ss){const sh=ss.getSheetByName('STAFF');const out={};if(!findRow_(sh,'staff_id','owner')){out.ownerPin=randomDigits_(6);let salt=Utilities.getUuid();appendObj_(sh,{staff_id:'owner',name:'Owner',pin_hash:hashPin_(out.ownerPin,salt),salt:salt,role:'OWNER',active:true,created_at:new Date()});}if(!findRow_(sh,'staff_id','staff')){out.staffPin=randomDigits_(6);let salt=Utilities.getUuid();appendObj_(sh,{staff_id:'staff',name:'Staff',pin_hash:hashPin_(out.staffPin,salt),salt:salt,role:'STAFF',active:true,created_at:new Date()});}return out;}
 function seedMissions_(ss){const sh=ss.getSheetByName('MISSIONS');if(sh.getLastRow()>1)return;[
-['M001','主动出击','A','今晚主动挑战另一桌的一位玩家。',1,'CHALLENGE_SENT','AUTO'],
+['M001','主动出击','A','主动挑战另一桌的一位玩家，并让对方接受。',1,'CHALLENGE_ACCEPTED_BY_TARGET','AUTO'],
 ['M002','有人找你','C','让另一桌的一位玩家主动向你发起挑战。',1,'CHALLENGE_RECEIVED','AUTO'],
 ['M003','上场一次','A','参加一次 Host 宣布的舞台互动。',1,'STAGE_JOIN','AUTO'],
 ['M004','跨桌代表','A','代表你的桌参加一次正式跨桌比赛。',1,'CROSS_TABLE_GAME','AUTO'],
@@ -560,8 +654,18 @@ function seedMissions_(ss){const sh=ss.getSheetByName('MISSIONS');if(sh.getLastR
 ['M008','一起玩一局','B','跟另一桌的一位玩家完整玩一局现场小游戏。',1,'','PEER','{"different_table":true}'],
 ['M009','互相记住名字','B','跟另一桌的一位玩家互相记住对方名字。',1,'','PEER','{"different_table":true}'],
 ['M010','主动接受','A','接受一次另一桌玩家的 Challenge。',1,'CHALLENGE_ACCEPTED_TARGET','AUTO'],
-['M011','发出邀请','A','向另一桌发出一次 Challenge。',1,'CHALLENGE_SENT','AUTO'],
+['M011','发出邀请','A','向另一桌发出 Challenge，并让对方接受。',1,'CHALLENGE_ACCEPTED_BY_TARGET','AUTO'],
 ['M012','跨桌出现','A','参加一次跨桌活动。',1,'CROSS_TABLE_GAME','AUTO']
 ].forEach(x=>appendObj_(sh,{mission_id:x[0],title:x[1],type:x[2],description:x[3],reward_coin:x[4],trigger_event:x[5],verification:x[6],active:true,rule_json:x[7]||''}));}
+
+function migrateMissionsV130_(ss){
+  const sh=ss.getSheetByName('MISSIONS');
+  ['M001','M011'].forEach(id=>{
+    const m=findRow_(sh,'mission_id',id);
+    if(!m)return;
+    const desc=id==='M001'?'主动挑战另一桌的一位玩家，并让对方接受。':'向另一桌发出 Challenge，并让对方接受。';
+    updateRow_(sh,m._row,{description:desc,trigger_event:'CHALLENGE_ACCEPTED_BY_TARGET'});
+  });
+}
 function seedRewards_(ss){const sh=ss.getSheetByName('REWARDS');if(sh.getLastRow()>1)return;[['R005','5 Coin Reward',5,'小奖励，由现场Staff说明。'],['R010','10 Coin Reward',10,'指定兑换奖励。'],['R020','20 Coin Special',20,'Special Reward。']].forEach(x=>appendObj_(sh,{reward_id:x[0],name:x[1],cost:x[2],active:true,description:x[3]}));}
 function json_(o){return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON);}

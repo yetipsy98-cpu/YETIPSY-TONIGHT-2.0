@@ -9,15 +9,21 @@ state.notifiedChallenges=state.notifiedChallenges||[];
 state.notifiedClaims=state.notifiedClaims||[];
 state.outgoingStates=state.outgoingStates||{};
 let syncTimer=null,syncBusy=false,currentHome=null;
+const HOME_CACHE_KEY='yt_open_home_v13';
+const HOME_CACHE_MAX_AGE=12*60*60*1000;
 
 function save(){localStorage.setItem('yt_open_player',JSON.stringify(state))}
+function readHomeCache(sessionId){try{const x=JSON.parse(localStorage.getItem(HOME_CACHE_KEY)||'null');if(!x||!x.data||!x.sessionId)return null;if(sessionId&&x.sessionId!==sessionId)return null;if(Date.now()-Number(x.savedAt||0)>HOME_CACHE_MAX_AGE)return null;const d=x.data;if(d.incoming_challenge&&new Date(d.incoming_challenge.expires_at).getTime()<=Date.now())d.incoming_challenge=null;return d}catch(e){return null}}
+function writeHomeCache(r){if(!r||!r.ok||!r.session)return;try{localStorage.setItem(HOME_CACHE_KEY,JSON.stringify({sessionId:r.session.session_id,savedAt:Date.now(),data:r}))}catch(e){}}
+function clearHomeCache(){try{localStorage.removeItem(HOME_CACHE_KEY)}catch(e){}}
+function setSyncChip(mode){const e=document.getElementById('playerSyncChip');if(!e)return;e.className='playerSyncChip '+(mode||'');e.innerHTML=mode==='syncing'?'<i></i>SYNC':mode==='slow'?'<i></i>CACHED':'<i></i>LIVE'}
 function esc(s){return String(s??'').replace(/[<>&"']/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c]))}
 function toast(t,ms=2400){const d=document.createElement('div');d.className='toast';d.textContent=t;document.body.appendChild(d);setTimeout(()=>d.remove(),ms)}
 function cleanJoinUrl(){try{history.replaceState({},document.title,location.pathname)}catch(e){}}
 function errorText(e){return ({backend_not_configured:'还没填写 Apps Script API URL',qr_expired:'签到 QR 已刷新，请重新扫描 Staff QR',session_full:'本场人数已满',checkin_closed:'签到已经结束',session_closed:'签到已经结束',phone_exists:'这个 WhatsApp 已注册，请用老玩家登入',login_failed:'号码或 PIN 不正确',login_locked:'连续输入错误太多，请稍后再试',player_auth_required:'登入已过期，请重新登入',challenge_pending:'你还有一个 Challenge 等待处理中',game_not_live:'活动还没正式开始',target_must_be_other_table:'请选择另一桌玩家'})[e]||e||'发生错误'}
 function stopSync(){clearTimeout(syncTimer);syncTimer=null}
 function scheduleSync(ms=6500){stopSync();syncTimer=setTimeout(syncNow,ms)}
-function shell(body,profileMode=false){app.innerHTML=`<div class="topbar"><div class="brand">YETIPSY</div><div class="top-actions">${state.authToken?`<button class="iconBtn" id="notifyTop">${NotificationSupported()?(Notification.permission==='granted'?'ALERTS ✓':'ALERTS'):''}</button>`:''}<div class="badge">${profileMode?'MY PROFILE':'今晚开局'}</div></div></div><div id="screen">${body}</div><div class="footer">打开 · 看一眼 · 操作 · 收手机</div>`;const n=document.getElementById('notifyTop');if(n)n.onclick=enableNotifications}
+function shell(body,profileMode=false){app.innerHTML=`<div class="topbar"><div class="brand">YETIPSY</div><div class="top-actions">${state.authToken&&state.sessionId&&!profileMode?`<div class="playerSyncChip" id="playerSyncChip"><i></i>LIVE</div>`:''}${state.authToken?`<button class="iconBtn" id="notifyTop">${NotificationSupported()?(Notification.permission==='granted'?'ALERTS ✓':'ALERTS'):''}</button>`:''}<div class="badge">${profileMode?'MY PROFILE':'今晚开局'}</div></div></div><div id="screen">${body}</div><div class="footer">打开 · 看一眼 · 操作 · 收手机</div>`;const n=document.getElementById('notifyTop');if(n)n.onclick=enableNotifications}
 function NotificationSupported(){return 'Notification' in window}
 
 async function init(){
@@ -43,7 +49,7 @@ async function joinGate(){
   state.join={sid:joinSid,token:joinToken};save();
   if(state.authToken){
     const r=await API.post('resumeAndCheckIn',{authToken:state.authToken,sessionId:joinSid,token:joinToken,deviceId:state.deviceId});
-    if(r.ok){state.sessionId=joinSid;save();cleanJoinUrl();return checkinSuccess(r.checkin)}
+    if(r.ok){state.sessionId=joinSid;save();if(r.bootstrap)writeHomeCache(r.bootstrap);cleanJoinUrl();return checkinSuccess(r.checkin,r.bootstrap)}
   }
   authChoice(gate.session);
 }
@@ -56,25 +62,37 @@ function authChoice(session){
   document.getElementById('newTab').onclick=newForm;document.getElementById('oldTab').onclick=oldForm;newForm();
 }
 
-async function register(){const btn=document.getElementById('join');btn.disabled=true;btn.textContent='JOINING…';const r=await API.post('registerAndCheckIn',{sessionId:joinSid,token:joinToken,deviceId:state.deviceId,nickname:document.getElementById('nick').value,phone:document.getElementById('phone').value,pin:document.getElementById('pin').value,companionCode:document.getElementById('companion').value});if(!r.ok){btn.disabled=false;btn.textContent='JOIN TONIGHT';return toast(errorText(r.error))}state.authToken=r.auth_token;state.playerId=r.player_id;state.sessionId=joinSid;save();cleanJoinUrl();checkinSuccess(r.checkin)}
-async function login(){const btn=document.getElementById('join');btn.disabled=true;btn.textContent='CHECKING…';const r=await API.post('loginAndCheckIn',{sessionId:joinSid,token:joinToken,deviceId:state.deviceId,phone:document.getElementById('phone').value,pin:document.getElementById('pin').value,companionCode:document.getElementById('companion').value});if(!r.ok){btn.disabled=false;btn.textContent='CHECK IN';return toast(errorText(r.error))}state.authToken=r.auth_token;state.playerId=r.player_id;state.sessionId=joinSid;save();cleanJoinUrl();checkinSuccess(r.checkin)}
+async function register(){const btn=document.getElementById('join');btn.disabled=true;btn.textContent='JOINING…';const r=await API.post('registerAndCheckIn',{sessionId:joinSid,token:joinToken,deviceId:state.deviceId,nickname:document.getElementById('nick').value,phone:document.getElementById('phone').value,pin:document.getElementById('pin').value,companionCode:document.getElementById('companion').value});if(!r.ok){btn.disabled=false;btn.textContent='JOIN TONIGHT';return toast(errorText(r.error))}state.authToken=r.auth_token;state.playerId=r.player_id;state.sessionId=joinSid;save();if(r.bootstrap)writeHomeCache(r.bootstrap);cleanJoinUrl();checkinSuccess(r.checkin,r.bootstrap)}
+async function login(){const btn=document.getElementById('join');btn.disabled=true;btn.textContent='CHECKING…';const r=await API.post('loginAndCheckIn',{sessionId:joinSid,token:joinToken,deviceId:state.deviceId,phone:document.getElementById('phone').value,pin:document.getElementById('pin').value,companionCode:document.getElementById('companion').value});if(!r.ok){btn.disabled=false;btn.textContent='CHECK IN';return toast(errorText(r.error))}state.authToken=r.auth_token;state.playerId=r.player_id;state.sessionId=joinSid;save();if(r.bootstrap)writeHomeCache(r.bootstrap);cleanJoinUrl();checkinSuccess(r.checkin,r.bootstrap)}
 
-function checkinSuccess(c){
-  shell(`<div class="hero"><div class="kicker">YOU'RE IN</div><h1 class="title">今晚已签到。</h1></div><div class="card gold"><div class="small">YOUR TABLE</div><div class="bigTable">${esc(c.table_id)}</div><div class="lead" style="margin:10px 0 0">Seat · <b style="color:var(--ink)">${esc(c.seat_code)}</b></div></div><button class="btn primary" id="enterHome">ENTER TONIGHT</button>${NotificationSupported()&&Notification.permission!=='granted'?`<button class="btn secondary" id="enableAlerts">ENABLE CHALLENGE ALERTS</button><p class="small" style="text-align:center">页面在后台时，新 Challenge 可弹通知。</p>`:''}`);
+function checkinSuccess(c,bootstrap){
+  if(bootstrap)writeHomeCache(bootstrap);
+  shell(`<div class="hero"><div class="kicker">YOU'RE IN</div><h1 class="title">今晚已签到。</h1></div><div class="card gold"><div class="small">YOUR TABLE</div><div class="bigTable">${esc(c.table_id)}</div><div class="lead" style="margin:10px 0 0">Seat · <b style="color:var(--ink)">${esc(c.seat_code)}</b></div></div><button class="btn primary" id="enterHome">ENTER TONIGHT</button>${bootstrap?'<div class="preloadReady">✓ TONIGHT READY · 已预载</div>':'<div class="preloadReady">TONIGHT WILL LOAD ON ENTER</div>'}${NotificationSupported()&&Notification.permission!=='granted'?`<button class="btn secondary" id="enableAlerts">ENABLE CHALLENGE ALERTS</button><p class="small" style="text-align:center">页面在后台时，新 Challenge 可弹通知。</p>`:''}`);
   document.getElementById('enterHome').onclick=home;const b=document.getElementById('enableAlerts');if(b)b.onclick=enableNotifications;
 }
 
 async function home(){
   stopSync();
-  shell(`<div class="hero"><div class="kicker">LOADING TONIGHT</div><h1 class="title">正在恢复你的今晚…</h1></div>`);
+  const cached=readHomeCache(state.sessionId);
+  if(cached&&cached.session){
+    currentHome=cached;
+    state.sessionId=cached.session.session_id;save();
+    renderHomeShell(cached);
+    setSyncChip('syncing');
+    processRealtime(cached,true);
+    scheduleSync(80);
+    return;
+  }
+
+  shell(`<div class="hero"><div class="kicker">LOADING TONIGHT</div><h1 class="title">第一次载入今晚…</h1><div class="homeBoot"><div class="bigSpinner"></div><div class="small">载入后会保存在手机，下次直接秒开。</div></div></div>`);
   const r=await API.post('playerHome',{authToken:state.authToken,sessionId:state.sessionId});
   if(!r.ok){
-    if(r.error==='player_auth_required'){clearAuth();return publicLanding()}
-    shell(`<div class="hero"><h1 class="title">暂时连不到今晚。</h1><p class="lead">${esc(errorText(r.error))}</p><button class="btn primary" id="retryHome">RETRY</button><button class="btn secondary" id="myProfileFallback">MY PROFILE</button></div>`,true);
+    if(r.error==='player_auth_required'){clearHomeCache();clearAuth();return publicLanding()}
+    shell(`<div class="hero"><h1 class="title">网络有点慢。</h1><p class="lead">${esc(errorText(r.error))}</p><button class="btn primary" id="retryHome">RETRY</button><button class="btn secondary" id="myProfileFallback">MY PROFILE</button></div>`,true);
     document.getElementById('retryHome').onclick=home;document.getElementById('myProfileFallback').onclick=profileLanding;return;
   }
   if(!r.session)return profileLanding();
-  state.sessionId=r.session.session_id;save();currentHome=r;renderHomeShell(r);processRealtime(r,true);scheduleSync();
+  state.sessionId=r.session.session_id;save();currentHome=r;writeHomeCache(r);renderHomeShell(r);setSyncChip('live');processRealtime(r,true);scheduleSync();
 }
 
 function renderHomeShell(r){
@@ -98,7 +116,7 @@ function bindHomeButtons(){
 }
 
 function applyHomePatch(r){
-  currentHome=r;state.sessionId=r.session.session_id;save();
+  currentHome=r;state.sessionId=r.session.session_id;save();writeHomeCache(r);setSyncChip('live');
   text('coinValue','🪙 '+Number(r.coin_balance||0));
   text('gameNo','#'+String(r.session.game_no).padStart(3,'0'));
   const st=document.getElementById('sessionStatus');if(st){st.textContent=r.session.status;st.className='status '+(r.session.status==='LIVE'?'live':'')}
@@ -115,13 +133,15 @@ function scoreHtml(scores){if(scores.length<2)return'';return `<div class="card 
 function missionPreview(m,status){if(!m||!['TABLES_LOCKED','LIVE','ENDED'].includes(status))return `<div class="card"><div class="small">SECRET MISSION</div><p class="lead" style="margin:8px 0 0">分桌锁定后才会出现。</p></div>`;const done=m.status==='COMPLETED';return `<div class="card"><div class="small">SECRET MISSION</div><h3 style="margin:8px 0">${done?'✅ MISSION COMPLETE':'🎭 点击 MY MISSION 查看'}</h3><span class="status">${esc(m.status)}</span></div>`}
 
 async function syncNow(manual=false){
-  if(syncBusy||!state.authToken||!state.sessionId)return scheduleSync();syncBusy=true;
+  if(syncBusy||!state.authToken||!state.sessionId)return scheduleSync();
+  syncBusy=true;setSyncChip('syncing');
   try{
     const r=await API.post('playerHome',{authToken:state.authToken,sessionId:state.sessionId});
     if(r.ok&&r.session){applyHomePatch(r);processRealtime(r,false)}
-    else if(r.error==='player_auth_required'){stopSync();clearAuth();toast('登入已过期，请重新登入')}
-    else if(manual)toast(errorText(r.error));
-  }finally{syncBusy=false;scheduleSync(document.hidden?9000:6500)}
+    else if(r.error==='player_auth_required'){stopSync();clearHomeCache();clearAuth();toast('登入已过期，请重新登入')}
+    else {setSyncChip('slow');if(manual)toast(errorText(r.error))}
+  }catch(e){setSyncChip('slow');if(manual)toast('同步较慢，当前先使用手机缓存')}
+  finally{syncBusy=false;scheduleSync(document.hidden?9000:6500)}
 }
 
 function processRealtime(r,initial){
@@ -160,14 +180,17 @@ function missionDrawer(m){
 async function claimMission(){const code=document.getElementById('targetCode').value.trim();const r=await API.post('claimMission',{authToken:state.authToken,sessionId:state.sessionId,targetPlayerId:code});if(!r.ok)return toast(errorText(r.error));toast('已发送互证请求');closeDrawer();syncNow()}
 
 async function challengeDrawer(){
-  openDrawer(`<div class="kicker">CHALLENGE</div><h2 class="title">挑战另一桌。</h2><p class="lead">接受后把手机收起来，现实里玩。普通 Challenge 不计 Team Score。</p><div class="card flat" id="challengeContent"><div class="small">LOADING PLAYERS…</div></div><button class="btn secondary" onclick="closeDrawer()">CLOSE</button>`);
-  const r=await API.post('getChallengeTargets',{authToken:state.authToken,sessionId:state.sessionId});
-  const box=document.getElementById('challengeContent');if(!box)return;
-  if(!r.ok){box.innerHTML=`<div class="bad">${esc(errorText(r.error))}</div>`;return}
-  if(!r.targets.length){box.innerHTML=`<div class="small">现在没有其他桌玩家可以挑战。</div>`;return}
-  box.innerHTML=`<label>Player</label><select id="target">${r.targets.map(x=>`<option value="${esc(x.player_id)}">TABLE ${esc(x.table_id)} · ${esc(x.nickname)}</option>`).join('')}</select><label>Game</label><select id="game"><option>十五二十</option><option>大话骰</option><option>抓手指</option><option>猜拳</option><option>自选</option></select><button class="btn primary" id="sendChallenge">SEND CHALLENGE</button>`;
-  document.getElementById('sendChallenge').onclick=sendChallenge;
+  const targets=(currentHome&&currentHome.challenge_targets)||[];
+  openDrawer(`<div class="kicker">CHALLENGE</div><h2 class="title">挑战另一桌。</h2><p class="lead">名单已经跟今晚状态一起预载。对方接受后才算正式 Challenge。</p><div class="card flat" id="challengeContent">${challengeTargetHtml(targets)}</div><button class="btn secondary" onclick="closeDrawer()">CLOSE</button>`);
+  bindChallengeForm();
+  // Quietly ask for a fresh snapshot, but never block the drawer.
+  syncNow(false);
 }
+function challengeTargetHtml(targets){
+  if(!targets||!targets.length)return `<div class="small">现在没有其他桌玩家可以挑战。名单会自动同步，不需要刷新页面。</div>`;
+  return `<label>Player</label><select id="target">${targets.map(x=>`<option value="${esc(x.player_id)}">TABLE ${esc(x.table_id)} · ${esc(x.nickname)}</option>`).join('')}</select><label>Game</label><select id="game"><option>十五二十</option><option>大话骰</option><option>抓手指</option><option>猜拳</option><option>自选</option></select><button class="btn primary" id="sendChallenge">SEND CHALLENGE</button>`;
+}
+function bindChallengeForm(){const b=document.getElementById('sendChallenge');if(b)b.onclick=sendChallenge}
 async function sendChallenge(){const b=document.getElementById('sendChallenge');b.disabled=true;b.textContent='SENDING…';const r=await API.post('sendChallenge',{authToken:state.authToken,sessionId:state.sessionId,toPlayerId:document.getElementById('target').value,game:document.getElementById('game').value});if(!r.ok){b.disabled=false;b.textContent='SEND CHALLENGE';return toast(errorText(r.error))}toast('Challenge 已发出');closeDrawer();syncNow()}
 
 function incomingChallengeDrawer(c){
@@ -193,10 +216,13 @@ async function profileLanding(){
   const r=await API.post('playerProfile',{authToken:state.authToken});
   if(!r.ok){if(r.error==='player_auth_required'){clearAuth();return publicLanding()}return shell(`<div class="hero"><h1 class="title">暂时无法读取 Profile。</h1><p class="lead">${esc(errorText(r.error))}</p></div>`,true)}
   const active=r.active_session;
+  if(active)preloadActiveTonight(active.session.session_id);
   shell(`<div class="identity"><div class="avatar">${esc(r.player.nickname.slice(0,1).toUpperCase())}</div><div><b>${esc(r.player.nickname)}</b><span>${esc(r.player.player_id)}</span></div></div><div class="card gold"><div class="small">TIPSY COIN</div><div class="coin">🪙 ${r.coin_balance}</div><p class="small">Coin 是长期账号余额，不需要在活动现场才能查看。</p></div>${active?`<div class="notice"><b>今晚你已经签到 · TABLE ${esc(active.table_id)}</b><br><span class="small">${esc(active.session.status)}</span></div><button class="btn primary" id="returnTonight">RETURN TO TONIGHT</button>`:''}<div class="grid3"><div class="kpi"><b>${r.player.lifetime_sessions}</b><span>SESSIONS</span></div><div class="kpi"><b>${r.missions_completed}</b><span>MISSIONS</span></div><div class="kpi"><b>${r.challenges}</b><span>CHALLENGES</span></div></div><div class="sectionTitle"><h2>My Player QR</h2><span>同行 / 快速识别</span></div><div class="card flat"><div class="qrWrap smallQr" id="playerQr"></div><div class="small" style="text-align:center;margin-top:10px">${esc(r.player.player_id)}</div></div><div class="sectionTitle"><h2>Rewards</h2></div><div class="list">${r.rewards.map(x=>`<div class="listItem"><div class="grow"><b>${esc(x.name)}</b><div class="meta">🪙 ${x.cost} · ${esc(x.description)}</div></div><button class="iconBtn redeem" data-id="${esc(x.reward_id)}" ${r.coin_balance<x.cost?'disabled':''}>REDEEM</button></div>`).join('')}</div><div class="sectionTitle"><h2>Recent Coin</h2></div><div class="list">${r.ledger.length?r.ledger.slice(0,15).map(x=>`<div class="listItem"><div class="grow"><b>${esc(x.reason)}</b><div class="meta">${esc(x.created_at)}</div></div><b class="${Number(x.delta)>=0?'ok':'bad'}">${Number(x.delta)>=0?'+':''}${x.delta}</b></div>`).join(''):'<div class="small">还没有 Coin 记录。</div>'}</div><button class="btn ghost" id="logoutProfile">LOG OUT</button>`,true);
   drawPlayerQr(r.player.player_id);document.querySelectorAll('.redeem').forEach(b=>b.onclick=()=>redeem(b.dataset.id));
   const rt=document.getElementById('returnTonight');if(rt)rt.onclick=()=>{state.sessionId=active.session.session_id;save();home()};document.getElementById('logoutProfile').onclick=()=>{clearAuth();publicLanding()};
 }
+
+function preloadActiveTonight(sessionId){if(!sessionId||readHomeCache(sessionId))return;API.post('playerHome',{authToken:state.authToken,sessionId}).then(r=>{if(r&&r.ok&&r.session)writeHomeCache(r)}).catch(()=>{})}
 
 function standaloneLoginDrawer(){
   openDrawer(`<div class="kicker">MY PROFILE</div><h2 class="title">老玩家登入。</h2><div class="card flat"><label>WhatsApp Number</label><input class="field" id="profilePhone" inputmode="tel"><label>4-digit PIN</label><input class="field" id="profilePin" inputmode="numeric" maxlength="4"></div><button class="btn primary" id="profileLoginGo">LOGIN</button><button class="btn secondary" onclick="closeDrawer()">CLOSE</button>`);
@@ -228,7 +254,7 @@ function alertUser(title,body){
 }
 function beep(){try{const C=window.AudioContext||window.webkitAudioContext;if(!C)return;const c=new C(),o=c.createOscillator(),g=c.createGain();o.frequency.value=540;g.gain.value=.06;o.connect(g).connect(c.destination);o.start();g.gain.exponentialRampToValueAtTime(.0001,c.currentTime+.2);o.stop(c.currentTime+.21);setTimeout(()=>c.close(),350)}catch(e){}}
 function registerServiceWorker(){if('serviceWorker'in navigator)navigator.serviceWorker.register('./sw.js?v=1.1.0').catch(()=>{})}
-function clearAuth(){state.authToken='';state.playerId='';state.sessionId='';save();stopSync()}
+function clearAuth(){state.authToken='';state.playerId='';state.sessionId='';save();clearHomeCache();stopSync()}
 
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&state.authToken&&state.sessionId)syncNow(true)});
 window.addEventListener('focus',()=>{if(state.authToken&&state.sessionId)syncNow()});

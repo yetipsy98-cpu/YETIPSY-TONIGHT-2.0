@@ -77,3 +77,14 @@ pre.codebox{white-space:pre-wrap;word-break:break-word;background:#0d0b08;border
 .toast{opacity:0;transition:opacity .16s ease,transform .16s ease;transform:translate(-50%,8px)}.toast.show{opacity:1;transform:translate(-50%,0)}.toast.toastBad{background:#2a1712;color:#f5c4b6;border:1px solid rgba(230,161,143,.28)}
 
 @media(max-width:620px){.staffSync span{display:none}.staffSync{padding:7px}.top-actions{gap:6px}}
+
+/* V1.3 instant restore / cached player home */
+.playerSyncChip{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--line);border-radius:999px;padding:6px 8px;font-size:9px;letter-spacing:.08em;color:var(--ok);white-space:nowrap}
+.playerSyncChip i{width:6px;height:6px;border-radius:50%;background:var(--ok)}
+.playerSyncChip.syncing{color:var(--gold);border-color:rgba(205,168,109,.3)}
+.playerSyncChip.syncing i{background:var(--gold);animation:syncPulse .8s ease-in-out infinite}
+.playerSyncChip.slow{color:var(--muted)}
+.playerSyncChip.slow i{background:#7f776d}
+.preloadReady{text-align:center;margin:11px 0 0;color:var(--ok);font-size:10px;letter-spacing:.08em}
+.homeBoot{display:grid;justify-items:center;gap:14px;padding:28px 0}
+@media(max-width:520px){.playerSyncChip{padding:6px}.playerSyncChip{font-size:0}.playerSyncChip i{margin:0}}
